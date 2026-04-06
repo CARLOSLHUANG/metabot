@@ -13,6 +13,40 @@ export type MessageHandler = (msg: IncomingMessage) => void;
 const MEMBER_COUNT_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const memberCountCache = new Map<string, { count: number; ts: number }>();
 
+// Cache for recent media messages in group chats (file/image sent without @mention).
+// When a user later @mentions the bot, cached media is attached automatically.
+const MEDIA_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+interface CachedMedia {
+  messageId: string;
+  imageKey?: string;
+  fileKey?: string;
+  fileName?: string;
+  ts: number;
+}
+const pendingMediaCache = new Map<string, CachedMedia[]>(); // key: chatId:userId
+
+function cacheMediaKey(chatId: string, userId: string): string {
+  return `${chatId}:${userId}`;
+}
+
+function getCachedMedia(chatId: string, userId: string): CachedMedia[] {
+  const key = cacheMediaKey(chatId, userId);
+  const items = pendingMediaCache.get(key);
+  if (!items) return [];
+  const now = Date.now();
+  const valid = items.filter(m => now - m.ts < MEDIA_CACHE_TTL_MS);
+  if (valid.length === 0) {
+    pendingMediaCache.delete(key);
+    return [];
+  }
+  pendingMediaCache.set(key, valid);
+  return valid;
+}
+
+function clearCachedMedia(chatId: string, userId: string): void {
+  pendingMediaCache.delete(cacheMediaKey(chatId, userId));
+}
+
 async function isPrivateLikeGroup(chatId: string, sender: MessageSender): Promise<boolean> {
   const cached = memberCountCache.get(chatId);
   if (cached && Date.now() - cached.ts < MEMBER_COUNT_CACHE_TTL_MS) {
@@ -71,6 +105,17 @@ export function createEventDispatcher(
             // Check if this is a private-like group (only 2 members)
             if (messageSender && await isPrivateLikeGroup(chatId, messageSender)) {
               logger.debug({ chatId }, 'Private-like group (2 members), processing without @mention');
+            } else if (msgType === 'image' || msgType === 'file') {
+              // Cache media messages for later retrieval when user @mentions bot
+              const media = parseMediaMessage(message, msgType, logger);
+              if (media) {
+                const key = cacheMediaKey(chatId, userId);
+                const items = pendingMediaCache.get(key) || [];
+                items.push({ ...media, messageId, ts: Date.now() });
+                pendingMediaCache.set(key, items);
+                logger.info({ chatId, userId, msgType, ...media }, 'Cached group media for later @mention');
+              }
+              return;
             } else {
               logger.debug('Ignoring group message without @mention');
               return;
@@ -115,12 +160,13 @@ export function createEventDispatcher(
           text = '请分析这个文件';
           logger.info({ userId, chatId, chatType, fileKey, fileName }, 'Received file message');
         } else if (msgType === 'post') {
-          // Rich text (post) message: extract plain text from nested structure
+          // Rich text (post) message: extract plain text and images from nested structure
           try {
             const content = JSON.parse(message.content);
             logger.debug({ postContent: JSON.stringify(content).slice(0, 500) }, 'Raw post content');
             text = extractTextFromPost(content);
-            logger.debug({ extractedText: text.slice(0, 200) }, 'Extracted post text');
+            imageKey = extractImageFromPost(content);
+            logger.debug({ extractedText: text.slice(0, 200), imageKey }, 'Extracted post content');
           } catch {
             logger.warn({ content: message.content }, 'Failed to parse post message content');
             return;
@@ -144,15 +190,36 @@ export function createEventDispatcher(
           // Strip Feishu auto-generated markdown links: [text](url) → text
           text = text.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
 
-          if (!text) {
+          if (!text && !imageKey) {
             logger.debug('Empty message after stripping mentions');
             return;
           }
 
-          logger.info({ userId, chatId, chatType, text: text.slice(0, 100) }, 'Received message');
+          // If text is empty but we have an image (e.g. @bot + image in group chat), set default prompt
+          if (!text && imageKey) {
+            text = '请分析这张图片';
+          }
+
+          logger.info({ userId, chatId, chatType, text: text.slice(0, 100), imageKey }, 'Received message');
         }
 
-        onMessage({ messageId, chatId, chatType, userId, text, imageKey, fileKey, fileName });
+        // In group chats, attach any cached media from this user
+        let extraMedia: IncomingMessage['extraMedia'];
+        if (chatType === 'group') {
+          const cached = getCachedMedia(chatId, userId);
+          if (cached.length > 0) {
+            extraMedia = cached.map(m => ({
+              messageId: m.messageId,
+              imageKey: m.imageKey,
+              fileKey: m.fileKey,
+              fileName: m.fileName,
+            }));
+            clearCachedMedia(chatId, userId);
+            logger.info({ chatId, userId, mediaCount: cached.length }, 'Attached cached media to @mention message');
+          }
+        }
+
+        onMessage({ messageId, chatId, chatType, userId, text, imageKey, fileKey, fileName, extraMedia });
       } catch (err) {
         logger.error({ err }, 'Error handling message event');
       }
@@ -160,6 +227,64 @@ export function createEventDispatcher(
   });
 
   return dispatcher;
+}
+
+/** Parse image/file message content, returning media fields or undefined on failure. */
+function parseMediaMessage(
+  message: any, msgType: string, logger: Logger,
+): { imageKey?: string; fileKey?: string; fileName?: string } | undefined {
+  try {
+    const content = JSON.parse(message.content);
+    if (msgType === 'image') {
+      const imageKey = content.image_key;
+      return imageKey ? { imageKey } : undefined;
+    }
+    if (msgType === 'file') {
+      const fileKey = content.file_key;
+      const fileName = content.file_name;
+      return (fileKey && fileName) ? { fileKey, fileName } : undefined;
+    }
+  } catch {
+    logger.warn({ msgType }, 'Failed to parse media message for caching');
+  }
+  return undefined;
+}
+
+/**
+ * Extract the first image_key from a Feishu post (rich text) message.
+ * Looks for { tag: "img", image_key: "..." } elements in the post content.
+ */
+function extractImageFromPost(content: Record<string, unknown>): string | undefined {
+  const bodies: Array<Record<string, unknown>> = [];
+
+  if (Array.isArray(content.content)) {
+    bodies.push(content);
+  } else {
+    for (const locale of Object.values(content)) {
+      if (locale && typeof locale === 'object' && !Array.isArray(locale)) {
+        const loc = locale as Record<string, unknown>;
+        if (Array.isArray(loc.content)) {
+          bodies.push(loc);
+        }
+      }
+    }
+  }
+
+  for (const body of bodies) {
+    const paragraphs = body.content as unknown[][];
+    for (const paragraph of paragraphs) {
+      if (!Array.isArray(paragraph)) continue;
+      for (const element of paragraph) {
+        if (!element || typeof element !== 'object') continue;
+        const el = element as Record<string, unknown>;
+        if (el.tag === 'img' && typeof el.image_key === 'string') {
+          return el.image_key;
+        }
+      }
+    }
+  }
+
+  return undefined;
 }
 
 /**
